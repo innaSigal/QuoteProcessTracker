@@ -1021,5 +1021,32 @@ with st.container(border=True):
             use_container_width=True,
         )
 
-with st.expander("✅ Subitems (customized view)", expanded=True):
-    st.dataframe(view_df, use_container_width=True)
+# --- TABLE (single) : view OR edit the same view_df ----------------------
+st.write("")  # small spacing
+st.subheader("Subitems table")
+
+# One toggle to switch to edit mode
+edit_mode = st.toggle(
+    "✏️ Edit table",
+    value=False,
+    key="edit_toggle",
+    help="Turn on to edit the table below."
+)
+
+if edit_mode:
+    # Keep subitem_id read-only unless user chose to include it
+    disabled_cols = [] if ("subitem_id" in view_df.columns) and st.session_state.get("include_id_checked", False) else ["subitem_id"]
+    current = st.data_editor(
+        view_df,
+        key="editor_view_df",            # unique key
+        use_container_width=True,
+        hide_index=True,
+        num_rows="dynamic",              # allow add/remove rows
+        disabled=disabled_cols,
+    )
+else:
+    current = view_df
+    st.dataframe(current, use_container_width=True, hide_index=True)
+
+# Save what the user is seeing/editing (so your downloads could also use this if you prefer)
+st.session_state["current_view_df"] = current
