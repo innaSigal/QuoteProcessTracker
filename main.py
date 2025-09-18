@@ -1217,96 +1217,93 @@ if st.button("Reset data to original"):
 
 # ===================== SUMMARY (Excel-aligned) ============================
 st.write("")
-if st.button("📊 Create summary", use_container_width=True):
+
+# 1) Turn the one-shot button into a persistent toggle
+#    (or keep the button but set a session flag)
+c1, c2 = st.columns([1,1])
+with c1:
+    if st.button("📊 Show / refresh summary", use_container_width=True, key="show_summary_btn"):
+        st.session_state["show_summary"] = True
+with c2:
+    if st.button("Hide summary", use_container_width=True, key="hide_summary_btn"):
+        st.session_state["show_summary"] = False
+
+show_summary = st.session_state.get("show_summary", False)
+
+if show_summary:
     st.subheader("Quote summary (Excel-aligned)")
 
     # ===== SUMMARY uses the VISIBLE ROWS only, de-duped by subitem_id =====
-    # take what you actually see in the table, else fall back
     src = st.session_state.get("current_view_df")
     if not isinstance(src, pd.DataFrame) or src.empty:
         src = st.session_state.get("master_df", final_df)
     src = src.copy()
-
-    # Use each row once (protect against accidental repeats)
     if "subitem_id" in src.columns:
         src = src.drop_duplicates(subset="subitem_id")
 
-    # --- Tiny debug readout so we can verify we're summing ~14 rows, not 1,280 ---
     with st.expander("ℹ️ Summary debug (rows & quick totals)", expanded=False):
         st.write("Rows used in summary:", len(src))
-
-
         def _num(col):
             return src[col].map(as_number).fillna(0.0) if col in src.columns else None
-
-
-        dbg_cols = ["Quantity", "List Price $", "Amount ($)", "Discount ($)", "CT Cost ($)"]
-        for c in dbg_cols:
+        for c in ["Quantity", "List Price $", "Amount ($)", "Discount ($)", "CT Cost ($)"]:
             s = _num(c)
             if s is not None:
                 st.write(f"Sum of **{c}**:", f"{float(s.sum()):,.2f}")
 
-
-    # ---------- matching Excel logic, but let Amount($) drive when present ----------
     def _need(title):
         if title in src.columns: return title
         return best_name_match_simple(title, list(map(str, src.columns)))
-
 
     def _num_series(name, default=0.0):
         if not name or name not in src.columns:
             return pd.Series([default] * len(src), index=src.index, dtype=float)
         return src[name].map(as_number).fillna(default)
 
-
-    col_qty = _need("Quantity")
+    col_qty       = _need("Quantity")
     col_list_unit = _need("List Price $")
-    col_amount = _need("Amount ($)")
-    col_disc_amt = _need("Discount ($)")
-    col_disc_pct = _need("Discount (%)")
+    col_amount    = _need("Amount ($)")
+    col_disc_amt  = _need("Discount ($)")
+    col_disc_pct  = _need("Discount (%)")
     col_cost_unit = _need("CT Cost ($)")
 
-    qty = _num_series(col_qty, 1.0)  # if missing, treat as 1
-    lp = _num_series(col_list_unit, 0.0)
-    amt = _num_series(col_amount, 0.0)
+    qty   = _num_series(col_qty, 1.0)
+    lp    = _num_series(col_list_unit, 0.0)
+    amt   = _num_series(col_amount, 0.0)
     discA = _num_series(col_disc_amt, 0.0)
     discP = _num_series(col_disc_pct, 0.0)
     costU = _num_series(col_cost_unit, 0.0)
-    # --- Choose how to compute "Total List Price ($)" ---
-    # OFF  -> sum of the unit "List Price $" column (your current expectation)
-    # ON   -> Excel 'Amount' logic (SUM(Amount) or SUM(Quantity×List Price))
+
+    # Persist these controls so editing them doesn't close the section
     use_amount_logic = st.checkbox(
         "Use Amount logic (Quantity × List Price)",
-        value=False,
-        help="Turn ON to match Excel SUM(Amount). Turn OFF to sum the unit List Price column only."
+        value=st.session_state.get("use_amount_logic", False),
+        key="use_amount_logic",
+        help="ON = sum Amount (or Quantity×List Price). OFF = sum the unit List Price column."
     )
 
     if use_amount_logic:
-        # Excel/Amount path
         total_list = float(amt.sum()) if col_amount else float((qty * lp).sum())
-        # Discounts computed off the same base
         if not col_disc_amt:
             base_for_disc = amt if col_amount else (qty * lp)
             discA = base_for_disc * (discP / 100.0)
     else:
-        # Unit-sum path (what you want: just add the List Price column)
         total_list = float(lp.sum())
-        # If Discount ($) missing, derive from pct * unit price (no quantity)
         if not col_disc_amt:
             discA = lp * (discP / 100.0)
 
-    # Cost totals
     total_cost = float((qty * costU).sum())
-
-    # Item-level net and margins
     total_discount = float(discA.sum())
     net_after_item_disc = total_list - total_discount
     gm_on_list = (1.0 - (total_cost / total_list)) if total_list > 0 else 0.0
     gm_after_item = (1.0 - (total_cost / net_after_item_disc)) if net_after_item_disc > 0 else 0.0
 
-    # Overall discount input (like Summary!B10)
+    # Persist the overall discount input
+    if "overall_discount_pct" not in st.session_state:
+        st.session_state["overall_discount_pct"] = 20.0
     overall_pct = st.number_input(
-        "Overall Discount (%)", min_value=0.0, max_value=100.0, value=20.0, step=1.0,
+        "Overall Discount (%)",
+        min_value=0.0, max_value=100.0, step=1.0,
+        key="overall_discount_pct",
         help="Matches the green input on the Excel Summary sheet."
     ) / 100.0
 
@@ -1314,14 +1311,8 @@ if st.button("📊 Create summary", use_container_width=True):
     net_after_overall = net_after_item_disc - overall_discount_amt
     gm_after_overall = (1.0 - (total_cost / net_after_overall)) if net_after_overall > 0 else 0.0
 
-
-    def _money(x):
-        return f"{x:,.2f}"
-
-
-    def _pct(x):
-        return f"{x * 100:,.1f}%"
-
+    def _money(x): return f"{x:,.2f}"
+    def _pct(x):   return f"{x * 100:,.1f}%"
 
     item_metrics = [
         ("Total List Price ($)", _money(total_list)),
@@ -1345,5 +1336,4 @@ if st.button("📊 Create summary", use_container_width=True):
     with c2:
         st.markdown("**Overall Discount Analysis**")
         st.table(pd.DataFrame(overall_metrics, columns=["Metric", "Value"]))
-    # ===== END SUMMARY =====
-
+# =================== END SUMMARY =====================
