@@ -1018,6 +1018,11 @@ if "master_df" not in st.session_state:
 
 
 # --- COLUMN PICKER + EXPORT (safe state pattern) ---
+def _on_view_changed():
+    # force the editor to remount when filters/columns change
+    st.session_state.pop("editor_view_df", None)
+    st.session_state.pop("_edit_buffer", None)   # ← add this line
+
 
 with st.container(border=True):
     st.subheader("Columns & Export")
@@ -1035,6 +1040,7 @@ with st.container(border=True):
         options=all_pickable,
         key="col_pick",
         help="Unselect columns to drop from the view.",
+        on_change=_on_view_changed,  # <— add this
     )
 
     if st.button("Reset to all columns"):
@@ -1052,61 +1058,133 @@ with st.container(border=True):
 
 
 
-# --- TABLE (single) : view OR edit the same view_df ----------------------
+# --- TABLE (single) : view OR edit the same view_df (live formulas) -----
 st.write("")  # small spacing
 st.subheader("Subitems table")
 
-# Start from the same view_df you built above
-# Ensure subitem_id is present in the editor for alignment
-edit_df = view_df.copy()
-if "subitem_id" not in edit_df.columns and "subitem_id" in st.session_state["master_df"].columns:
-    edit_df = pd.concat([st.session_state["master_df"]["subitem_id"], edit_df], axis=1)
+# Names of the 3 derived columns (do NOT include in the picker)
+DERIVED_COLS = [
+    "Total List Price ($)",
+    "Row Discount Amount ($)",
+    "Net Price After Discount ($)",
+]
+
+# Helper: find likely column names in the current view/master
+def _need_like(title: str, cols: list[str]) -> str :
+    if title in cols:
+        return title
+    hit = best_name_match_simple(title, cols)
+    return hit
+
+# Build the editor dataframe from the authoritative master view (so edits persist per your picker)
+edit_base = view_df.copy()
+
+# Compute formulas _before_ rendering so the editor shows fresh values every rerun
+all_cols_str = list(map(str, edit_base.columns))
+qty_col      = _need_like("Quantity", all_cols_str)
+price_col    = _need_like("List Price $", all_cols_str)
+disc_pct_col = _need_like("Discount (%)", all_cols_str)
+
+def _num(s):
+    return pd.to_numeric(s.apply(as_number), errors="coerce")
+
+qty  = _num(edit_base[qty_col])      if qty_col      in edit_base.columns else pd.Series(0, index=edit_base.index)
+lpu  = _num(edit_base[price_col])    if price_col    in edit_base.columns else pd.Series(0, index=edit_base.index)
+dpct = _num(edit_base[disc_pct_col]) if disc_pct_col in edit_base.columns else pd.Series(0, index=edit_base.index)
+
+tot_list = (qty * lpu).fillna(0.0)
+row_disc = (tot_list * (dpct/100.0)).fillna(0.0)
+net_price = (tot_list - row_disc).fillna(0.0)
+
+# Attach/refresh the derived columns (always present, read-only)
+edit_base[DERIVED_COLS[0]] = tot_list
+edit_base[DERIVED_COLS[1]] = row_disc
+edit_base[DERIVED_COLS[2]] = net_price
+
+# Keep subitem_id and derived columns read-only
+readonly_cols = [c for c in edit_base.columns if c in DERIVED_COLS or c == "subitem_id"]
 
 edit_mode = st.toggle("✏️ Edit table", value=False, key="edit_toggle", help="Turn on to edit the table below.")
 
 if edit_mode:
+    # 1) take the live buffer (or the latest computed view), then compute derived cols BEFORE rendering
+    buf = st.session_state.get("_edit_buffer", edit_base).copy()
+
+    cols_str = list(map(str, buf.columns))
+    def _need_like(title: str):
+        if title in cols_str:
+            return title
+        return best_name_match_simple(title, cols_str)
+
+    qty_col      = _need_like("Quantity")
+    price_col    = _need_like("List Price $")
+    disc_pct_col = _need_like("Discount (%)")
+
+    def _num(s: pd.Series):
+        return pd.to_numeric(s.apply(as_number), errors="coerce")
+
+    qty  = _num(buf[qty_col])      if qty_col      in buf.columns else pd.Series(0, index=buf.index)
+    lpu  = _num(buf[price_col])    if price_col    in buf.columns else pd.Series(0, index=buf.index)
+    dpct = _num(buf[disc_pct_col]) if disc_pct_col in buf.columns else pd.Series(0, index=buf.index)
+
+    buf[DERIVED_COLS[0]] = (qty * lpu).fillna(0.0)
+    buf[DERIVED_COLS[1]] = (buf[DERIVED_COLS[0]] * (dpct / 100.0)).fillna(0.0)
+    buf[DERIVED_COLS[2]] = (buf[DERIVED_COLS[0]] - buf[DERIVED_COLS[1]]).fillna(0.0)
+
+    # 2) render editor; dynamic key so it remounts when visible rows/cols change (fixes filter issue)
+    row_ids = tuple(buf["subitem_id"]) if "subitem_id" in buf.columns else tuple(buf.index)
+    _editor_fp = (tuple(buf.columns), row_ids)
+    editor_key = f"editor_view_df_{hash(_editor_fp)}"
+
+    readonly_cols = [c for c in buf.columns if c in DERIVED_COLS or c == "subitem_id"]
+
     edited = st.data_editor(
-        edit_df,
-        key="editor_view_df",
+        buf,
+        key=editor_key,
         use_container_width=True,
         hide_index=True,
         num_rows="dynamic",
-        disabled=["subitem_id"],  # keep id read-only
+        disabled=readonly_cols,
     )
 
-    cols_to_update = [c for c in edited.columns if c != "subitem_id"]
-    c1, c2 = st.columns([1,1])
+    # 3) keep only editable columns in the live buffer; next rerun will recompute derived columns
+    editable_cols = [c for c in edited.columns if c not in (DERIVED_COLS + ["subitem_id"])]
+    st.session_state["_edit_buffer"] = edited[editable_cols].copy()
 
+    # Save + Revert
+    c1, c2 = st.columns([1, 1])
     with c1:
         if st.button("💾 Save edits", type="primary", use_container_width=True):
-            # Commit only the edited columns to the master, aligned by subitem_id
-            master = st.session_state["master_df"].set_index("subitem_id")
-            incoming = edited.set_index("subitem_id")
+            master = st.session_state["master_df"].set_index("subitem_id") if "subitem_id" in st.session_state["master_df"].columns else st.session_state["master_df"].copy()
+            incoming = edited.set_index("subitem_id") if "subitem_id" in edited.columns else edited.copy()
 
-            # For new rows added in the editor, append them; for removed rows, drop them
-            # (If you don't want to allow add/remove rows, set num_rows="fixed" above)
-            combined_index = incoming.index
-            master = master.reindex(combined_index)
+            # Ensure rows match incoming (supports add/remove)
+            master = master.reindex(incoming.index)
 
-            # update only the visible/edited columns that exist in master
-            updatable = [c for c in cols_to_update if c in master.columns]
-            master.loc[combined_index, updatable] = incoming[updatable]
+            updatable = [c for c in editable_cols if c in master.columns]
+            master.loc[incoming.index, updatable] = incoming[updatable]
 
-            st.session_state["master_df"] = recompute_calculated(master.reset_index())
-
+            st.session_state["master_df"] = master.reset_index() if "subitem_id" in st.session_state["master_df"].columns else master
             st.success("Edits saved ✔")
 
     with c2:
         if st.button("↩️ Revert unsaved edits", use_container_width=True):
-            st.session_state.pop("editor_view_df", None)
+            st.session_state.pop("_edit_buffer", None)
+            # drop any editor key so it remounts cleanly
+            for k in list(st.session_state.keys()):
+                if str(k).startswith("editor_view_df_"):
+                    st.session_state.pop(k, None)
             st.rerun()
 
-    # What the user is currently looking at (for downloads below if needed)
+    # what the user is currently seeing (with live formulas)
     st.session_state["current_view_df"] = edited.copy()
 
 else:
-    st.dataframe(view_df, use_container_width=True, hide_index=True)
-    st.session_state["current_view_df"] = view_df.copy()
+    # Read-only view with the same formula columns
+    st.dataframe(edit_base, use_container_width=True, hide_index=True)
+    st.session_state["current_view_df"] = edit_base.copy()
+
+
 
 st.write("")  # spacing
 
