@@ -836,7 +836,9 @@ if "_items_for_group" in st.session_state:
         # ---------- END NEW ----------
 
         st.session_state["_linked_values"] = linked
-
+        # Clear any prior saved/edited data so the new item will re-init from fresh final_df
+        st.session_state.pop("master_df", None)
+        st.session_state.pop("_edit_buffer", None)
 
 # ==== FINAL (no refetch, no merge): fill _sub_df from _linked_values by normalized names ====
 
@@ -973,80 +975,297 @@ if SHOW_DEBUG:
                   for c in probe if c in final_df.columns}
         st.write("Non-empty counts:", counts)
 
+# --- Calculated columns setup -----------------------------------------------
+COMPUTED_COLS = [
+    "Total List Price ($)",
+    "Row Discount Amount ($)",
+    "Net Price After Discount ($)",
+]
+
+def _col_like(df: pd.DataFrame, title: str) -> str :
+    """Best-effort column (exact or your 'simple' matcher)."""
+    if title in df.columns:
+        return title
+    hit = best_name_match_simple(title, list(map(str, df.columns)))
+    return hit
+
+def recompute_calculated(df: pd.DataFrame) -> pd.DataFrame:
+    """(Re)compute the 3 calculated columns on a copy of df and return it."""
+    df = df.copy()
+
+    # resolve source columns by name (tolerant to variants)
+    c_qty   = _col_like(df, "Quantity")
+    c_list  = _col_like(df, "List Price $")
+    c_discP = _col_like(df, "Discount (%)")
+
+    qty   = df[c_qty].map(as_number)   if c_qty   else 0.0
+    lpu   = df[c_list].map(as_number)  if c_list  else 0.0
+    discP = df[c_discP].map(as_number) if c_discP else 0.0
+
+    total_list = (qty.fillna(0) * lpu.fillna(0))
+    row_disc   = total_list * (discP.fillna(0) / 100.0)
+    net_after  = total_list - row_disc
+
+    df["Total List Price ($)"]        = total_list
+    df["Row Discount Amount ($)"]     = row_disc
+    df["Net Price After Discount ($)"] = net_after
+    return df
+# ---------------------------------------------------------------------------
+
+# ---- initialize the authoritative, editable dataset from the filled table
+if "master_df" not in st.session_state:
+    st.session_state["master_df"] = recompute_calculated(final_df)
+
+
 # --- COLUMN PICKER + EXPORT (safe state pattern) ---
+
 with st.container(border=True):
     st.subheader("Columns & Export")
 
-    # 1) Build pickable columns from the final_df you already computed
-    all_pickable = [c for c in final_df.columns if c != "subitem_id"]
+    base_df = st.session_state["master_df"]              # << use the saved table
 
-    # 2) Initialize widget state ONCE (no default= in the widget)
+    # EXCLUDE computed columns from the picker so they can't be dropped
+    all_pickable = [c for c in base_df.columns if c not in (["subitem_id"] + COMPUTED_COLS)]
+
     if "col_pick" not in st.session_state:
-        st.session_state["col_pick"] = all_pickable[:]  # initial = all columns
+        st.session_state["col_pick"] = all_pickable[:]
 
-    # 3) The multiselect owns its state via key="col_pick"
     chosen = st.multiselect(
         "Columns to show (drag/select to reorder):",
         options=all_pickable,
         key="col_pick",
-        help="Unselect columns to drop from the view."
+        help="Unselect columns to drop from the view.",
     )
 
-    # 4) Reset button: clear widget state and rerun (avoids APIException)
     if st.button("Reset to all columns"):
         st.session_state.pop("col_pick", None)
         st.rerun()
 
     show_id = st.checkbox("Include subitem_id", value=False)
 
-    # 5) Build the view and downloads
-    view_cols = (["subitem_id"] if show_id else []) + chosen
-    view_df = final_df[view_cols].copy()
+    # Build the view from the master and ALWAYS append computed columns
+    view_cols = (["subitem_id"] if show_id else []) + chosen + COMPUTED_COLS
+    # dedupe while preserving order
+    seen = set()
+    view_cols = [c for c in view_cols if not (c in seen or seen.add(c))]
+    view_df = base_df[view_cols].copy()
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.download_button(
-            "Download CSV",
-            data=view_df.to_csv(index=False).encode("utf-8-sig"),
-            file_name="subitems_view.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-    with c2:
-        st.download_button(
-            "Download Excel (.xlsx)",
-            data=to_excel_bytes({"Subitems": view_df}),
-            file_name="subitems_view.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
+
 
 # --- TABLE (single) : view OR edit the same view_df ----------------------
 st.write("")  # small spacing
 st.subheader("Subitems table")
 
-# One toggle to switch to edit mode
-edit_mode = st.toggle(
-    "✏️ Edit table",
-    value=False,
-    key="edit_toggle",
-    help="Turn on to edit the table below."
-)
+# Start from the same view_df you built above
+# Ensure subitem_id is present in the editor for alignment
+edit_df = view_df.copy()
+if "subitem_id" not in edit_df.columns and "subitem_id" in st.session_state["master_df"].columns:
+    edit_df = pd.concat([st.session_state["master_df"]["subitem_id"], edit_df], axis=1)
+
+edit_mode = st.toggle("✏️ Edit table", value=False, key="edit_toggle", help="Turn on to edit the table below.")
 
 if edit_mode:
-    # Keep subitem_id read-only unless user chose to include it
-    disabled_cols = [] if ("subitem_id" in view_df.columns) and st.session_state.get("include_id_checked", False) else ["subitem_id"]
-    current = st.data_editor(
-        view_df,
-        key="editor_view_df",            # unique key
+    edited = st.data_editor(
+        edit_df,
+        key="editor_view_df",
         use_container_width=True,
         hide_index=True,
-        num_rows="dynamic",              # allow add/remove rows
-        disabled=disabled_cols,
+        num_rows="dynamic",
+        disabled=["subitem_id"],  # keep id read-only
     )
-else:
-    current = view_df
-    st.dataframe(current, use_container_width=True, hide_index=True)
 
-# Save what the user is seeing/editing (so your downloads could also use this if you prefer)
-st.session_state["current_view_df"] = current
+    cols_to_update = [c for c in edited.columns if c != "subitem_id"]
+    c1, c2 = st.columns([1,1])
+
+    with c1:
+        if st.button("💾 Save edits", type="primary", use_container_width=True):
+            # Commit only the edited columns to the master, aligned by subitem_id
+            master = st.session_state["master_df"].set_index("subitem_id")
+            incoming = edited.set_index("subitem_id")
+
+            # For new rows added in the editor, append them; for removed rows, drop them
+            # (If you don't want to allow add/remove rows, set num_rows="fixed" above)
+            combined_index = incoming.index
+            master = master.reindex(combined_index)
+
+            # update only the visible/edited columns that exist in master
+            updatable = [c for c in cols_to_update if c in master.columns]
+            master.loc[combined_index, updatable] = incoming[updatable]
+
+            st.session_state["master_df"] = recompute_calculated(master.reset_index())
+
+            st.success("Edits saved ✔")
+
+    with c2:
+        if st.button("↩️ Revert unsaved edits", use_container_width=True):
+            st.session_state.pop("editor_view_df", None)
+            st.rerun()
+
+    # What the user is currently looking at (for downloads below if needed)
+    st.session_state["current_view_df"] = edited.copy()
+
+else:
+    st.dataframe(view_df, use_container_width=True, hide_index=True)
+    st.session_state["current_view_df"] = view_df.copy()
+
+st.write("")  # spacing
+
+export_df = st.session_state["current_view_df"]
+
+c1, c2 = st.columns(2)
+with c1:
+    st.download_button(
+        "⬇️ Download CSV",
+        data=export_df.to_csv(index=False).encode("utf-8-sig"),
+        file_name="subitems_view.csv",
+        mime="text/csv",
+        key="dl_csv_after_edit",
+        use_container_width=True,
+    )
+with c2:
+    st.download_button(
+        "⬇️ Download Excel (.xlsx)",
+        data=to_excel_bytes({"Subitems": export_df}),
+        file_name="subitems_view.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="dl_xlsx_after_edit",
+        use_container_width=True,
+    )
+if st.button("Reset data to original"):
+    st.session_state["master_df"] = final_df.copy()
+    st.session_state.pop("editor_view_df", None)
+    st.success("Data reset to original values.")
+    st.rerun()
+
+# ===================== SUMMARY (Excel-aligned) ============================
+st.write("")
+if st.button("📊 Create summary", use_container_width=True):
+    st.subheader("Quote summary (Excel-aligned)")
+
+    # ===== SUMMARY uses the VISIBLE ROWS only, de-duped by subitem_id =====
+    # take what you actually see in the table, else fall back
+    src = st.session_state.get("current_view_df")
+    if not isinstance(src, pd.DataFrame) or src.empty:
+        src = st.session_state.get("master_df", final_df)
+    src = src.copy()
+
+    # Use each row once (protect against accidental repeats)
+    if "subitem_id" in src.columns:
+        src = src.drop_duplicates(subset="subitem_id")
+
+    # --- Tiny debug readout so we can verify we're summing ~14 rows, not 1,280 ---
+    with st.expander("ℹ️ Summary debug (rows & quick totals)", expanded=False):
+        st.write("Rows used in summary:", len(src))
+
+
+        def _num(col):
+            return src[col].map(as_number).fillna(0.0) if col in src.columns else None
+
+
+        dbg_cols = ["Quantity", "List Price $", "Amount ($)", "Discount ($)", "CT Cost ($)"]
+        for c in dbg_cols:
+            s = _num(c)
+            if s is not None:
+                st.write(f"Sum of **{c}**:", f"{float(s.sum()):,.2f}")
+
+
+    # ---------- matching Excel logic, but let Amount($) drive when present ----------
+    def _need(title):
+        if title in src.columns: return title
+        return best_name_match_simple(title, list(map(str, src.columns)))
+
+
+    def _num_series(name, default=0.0):
+        if not name or name not in src.columns:
+            return pd.Series([default] * len(src), index=src.index, dtype=float)
+        return src[name].map(as_number).fillna(default)
+
+
+    col_qty = _need("Quantity")
+    col_list_unit = _need("List Price $")
+    col_amount = _need("Amount ($)")
+    col_disc_amt = _need("Discount ($)")
+    col_disc_pct = _need("Discount (%)")
+    col_cost_unit = _need("CT Cost ($)")
+
+    qty = _num_series(col_qty, 1.0)  # if missing, treat as 1
+    lp = _num_series(col_list_unit, 0.0)
+    amt = _num_series(col_amount, 0.0)
+    discA = _num_series(col_disc_amt, 0.0)
+    discP = _num_series(col_disc_pct, 0.0)
+    costU = _num_series(col_cost_unit, 0.0)
+    # --- Choose how to compute "Total List Price ($)" ---
+    # OFF  -> sum of the unit "List Price $" column (your current expectation)
+    # ON   -> Excel 'Amount' logic (SUM(Amount) or SUM(Quantity×List Price))
+    use_amount_logic = st.checkbox(
+        "Use Amount logic (Quantity × List Price)",
+        value=False,
+        help="Turn ON to match Excel SUM(Amount). Turn OFF to sum the unit List Price column only."
+    )
+
+    if use_amount_logic:
+        # Excel/Amount path
+        total_list = float(amt.sum()) if col_amount else float((qty * lp).sum())
+        # Discounts computed off the same base
+        if not col_disc_amt:
+            base_for_disc = amt if col_amount else (qty * lp)
+            discA = base_for_disc * (discP / 100.0)
+    else:
+        # Unit-sum path (what you want: just add the List Price column)
+        total_list = float(lp.sum())
+        # If Discount ($) missing, derive from pct * unit price (no quantity)
+        if not col_disc_amt:
+            discA = lp * (discP / 100.0)
+
+    # Cost totals
+    total_cost = float((qty * costU).sum())
+
+    # Item-level net and margins
+    total_discount = float(discA.sum())
+    net_after_item_disc = total_list - total_discount
+    gm_on_list = (1.0 - (total_cost / total_list)) if total_list > 0 else 0.0
+    gm_after_item = (1.0 - (total_cost / net_after_item_disc)) if net_after_item_disc > 0 else 0.0
+
+    # Overall discount input (like Summary!B10)
+    overall_pct = st.number_input(
+        "Overall Discount (%)", min_value=0.0, max_value=100.0, value=20.0, step=1.0,
+        help="Matches the green input on the Excel Summary sheet."
+    ) / 100.0
+
+    overall_discount_amt = total_list * overall_pct
+    net_after_overall = net_after_item_disc - overall_discount_amt
+    gm_after_overall = (1.0 - (total_cost / net_after_overall)) if net_after_overall > 0 else 0.0
+
+
+    def _money(x):
+        return f"{x:,.2f}"
+
+
+    def _pct(x):
+        return f"{x * 100:,.1f}%"
+
+
+    item_metrics = [
+        ("Total List Price ($)", _money(total_list)),
+        ("Total Discount Amount ($)", _money(total_discount)),
+        ("Net Price After Item Discounts ($)", _money(net_after_item_disc)),
+        ("Total Cost ($)", _money(total_cost)),
+        ("Gross Margin on List Price (%)", _pct(gm_on_list)),
+        ("Gross Margin after Item Discounts (%)", _pct(gm_after_item)),
+    ]
+    overall_metrics = [
+        ("Overall Discount (%)", _pct(overall_pct)),
+        ("Overall Discount Amount ($)", _money(overall_discount_amt)),
+        ("Net Revenue After Overall Discount ($)", _money(net_after_overall)),
+        ("Gross Margin after Overall Discount (%)", _pct(gm_after_overall)),
+    ]
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Item-Level Metrics**")
+        st.table(pd.DataFrame(item_metrics, columns=["Metric", "Value"]))
+    with c2:
+        st.markdown("**Overall Discount Analysis**")
+        st.table(pd.DataFrame(overall_metrics, columns=["Metric", "Value"]))
+    # ===== END SUMMARY =====
+
