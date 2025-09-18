@@ -1329,11 +1329,49 @@ if show_summary:
         ("Gross Margin after Overall Discount (%)", _pct(gm_after_overall)),
     ]
 
+    # Build DataFrames for display & export
+    df_item = pd.DataFrame(item_metrics, columns=["Metric", "Value"])
+    df_over = pd.DataFrame(overall_metrics, columns=["Metric", "Value"])
+
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("**Item-Level Metrics**")
-        st.table(pd.DataFrame(item_metrics, columns=["Metric", "Value"]))
+        st.table(df_item)
     with c2:
         st.markdown("**Overall Discount Analysis**")
-        st.table(pd.DataFrame(overall_metrics, columns=["Metric", "Value"]))
+        st.table(df_over)
+
+    # --- Export buttons ---
+    c3, c4 = st.columns(2)
+    with c3:
+        # One Excel file, two sheets
+        st.download_button(
+            "⬇️ Download summary (Excel)",
+            data=to_excel_bytes({
+                "Item-Level Metrics": df_item,
+                "Overall Discount Analysis": df_over,
+            }),
+            file_name="quote_summary.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+
+    with c4:
+        # One CSV with a 'Table' column so both sections are together
+        df_both = pd.concat(
+            [
+                df_item.assign(Table="Item-Level Metrics"),
+                df_over.assign(Table="Overall Discount Analysis"),
+            ],
+            ignore_index=True,
+        )[["Table", "Metric", "Value"]]
+
+        st.download_button(
+            "⬇️ Download summary (CSV)",
+            data=df_both.to_csv(index=False).encode("utf-8-sig"),
+            file_name="quote_summary.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
 # =================== END SUMMARY =====================
