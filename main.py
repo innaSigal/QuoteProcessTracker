@@ -1469,37 +1469,16 @@ if show_summary:
         st.markdown("**Overall Discount Analysis**")
         st.table(df_over)
 
-    # --- Export buttons ---
-    c3, c4 = st.columns(2)
-    with c3:
-        # One Excel file, two sheets
-        st.download_button(
-            "⬇️ Download summary (Excel)",
-            data=to_excel_bytes({
-                "Item-Level Metrics": df_item,
-                "Overall Discount Analysis": df_over,
-            }),
-            file_name="quote_summary.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
-
-    with c4:
-        # One CSV with a 'Table' column so both sections are together
-        df_both = pd.concat(
-            [
-                df_item.assign(Table="Item-Level Metrics"),
-                df_over.assign(Table="Overall Discount Analysis"),
-            ],
-            ignore_index=True,
-        )[["Table", "Metric", "Value"]]
-
-        st.download_button(
-            "⬇️ Download summary (CSV)",
-            data=df_both.to_csv(index=False).encode("utf-8-sig"),
-            file_name="quote_summary.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
+    # --- One export: Excel with two sheets ---
+    st.download_button(
+        "⬇️ Download summary (Excel, two sheets)",
+        data=to_excel_bytes({
+            "Item-Level Metrics": df_item,
+            "Overall Discount Analysis": df_over,
+        }),
+        file_name="quote_summary.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
 
 # =================== END SUMMARY =====================
