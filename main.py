@@ -152,9 +152,11 @@ query ProductsByIdsAll($ids:[ID!]) {
 # ====== Helpers ======
 import re
 
-# ==== SIMPLE NAME MATCHING (exactly as requested) ====
-# normalize: lowercase + spaces -> underscores; keep symbols like $ / €
-import re
+def _show_or_refresh_summary():
+    # turn the section on and bump a nonce so Streamlit knows to redraw it
+    st.session_state["show_summary"] = True
+    st.session_state["_summary_nonce"] = st.session_state.get("_summary_nonce", 0) + 1
+
 
 def _norm_simple(s) -> str:
     s = "" if s is None else str(s)
@@ -1055,8 +1057,8 @@ with st.container(border=True):
     seen = set()
     view_cols = [c for c in view_cols if not (c in seen or seen.add(c))]
     view_df = base_df[view_cols].copy()
-
-
+    # Ensure a default so later blocks (export/summary) never KeyError
+    st.session_state["current_view_df"] = view_df.copy()
 
 # --- TABLE (single) : view OR edit the same view_df (live formulas) -----
 st.write("")  # small spacing
@@ -1083,7 +1085,10 @@ edit_base = view_df.copy()
 all_cols_str = list(map(str, edit_base.columns))
 qty_col      = _need_like("Quantity", all_cols_str)
 price_col    = _need_like("List Price $", all_cols_str)
-disc_pct_col = _need_like("Discount (%)", all_cols_str)
+disc_pct_col = (_need_like("Discount (%)", all_cols_str)
+                or _need_like("Discount %", all_cols_str)
+                or _need_like("Disc %", all_cols_str))
+
 
 def _num(s):
     return pd.to_numeric(s.apply(as_number), errors="coerce")
@@ -1107,9 +1112,18 @@ readonly_cols = [c for c in edit_base.columns if c in DERIVED_COLS or c == "subi
 edit_mode = st.toggle("✏️ Edit table", value=False, key="edit_toggle", help="Turn on to edit the table below.")
 
 if edit_mode:
-    # 1) take the live buffer (or the latest computed view), then compute derived cols BEFORE rendering
-    buf = st.session_state.get("_edit_buffer", edit_base).copy()
+    # --- columns we allow users to edit ---
+    editable_cols_base = [c for c in edit_base.columns if c not in (DERIVED_COLS + ["subitem_id"])]
 
+    raw_edits = st.session_state.get("_edit_buffer", edit_base[editable_cols_base]).copy()
+
+    buf = edit_base.copy()
+    for c in editable_cols_base:
+        if c in raw_edits.columns:
+            buf[c] = raw_edits[c]
+
+
+    # 3) recompute derived columns on the buffer BEFORE rendering editor
     cols_str = list(map(str, buf.columns))
     def _need_like(title: str):
         if title in cols_str:
@@ -1118,25 +1132,34 @@ if edit_mode:
 
     qty_col      = _need_like("Quantity")
     price_col    = _need_like("List Price $")
-    disc_pct_col = _need_like("Discount (%)")
+    disc_pct_col = (_need_like("Discount (%)")
+                    or _need_like("Discount %")
+                    or _need_like("Disc %"))
 
-    def _num(s: pd.Series):
-        return pd.to_numeric(s.apply(as_number), errors="coerce")
+    def _num_series(s: pd.Series | None):
+        if s is None:
+            return pd.Series(0.0, index=buf.index, dtype=float)
+        return pd.to_numeric(s.apply(as_number), errors="coerce").fillna(0.0)
 
-    qty  = _num(buf[qty_col])      if qty_col      in buf.columns else pd.Series(0, index=buf.index)
-    lpu  = _num(buf[price_col])    if price_col    in buf.columns else pd.Series(0, index=buf.index)
-    dpct = _num(buf[disc_pct_col]) if disc_pct_col in buf.columns else pd.Series(0, index=buf.index)
+    qty  = _num_series(buf[qty_col])      if qty_col      in buf.columns else _num_series(None)
+    lpu  = _num_series(buf[price_col])    if price_col    in buf.columns else _num_series(None)
+    dpct = _num_series(buf[disc_pct_col]) if disc_pct_col in buf.columns else _num_series(None)
 
-    buf[DERIVED_COLS[0]] = (qty * lpu).fillna(0.0)
-    buf[DERIVED_COLS[1]] = (buf[DERIVED_COLS[0]] * (dpct / 100.0)).fillna(0.0)
-    buf[DERIVED_COLS[2]] = (buf[DERIVED_COLS[0]] - buf[DERIVED_COLS[1]]).fillna(0.0)
+    buf[DERIVED_COLS[0]] = (qty * lpu)
+    buf[DERIVED_COLS[1]] = (buf[DERIVED_COLS[0]] * (dpct / 100.0))
+    buf[DERIVED_COLS[2]] = (buf[DERIVED_COLS[0]] - buf[DERIVED_COLS[1]])
 
-    # 2) render editor; dynamic key so it remounts when visible rows/cols change (fixes filter issue)
+    # 4) render editor with per-column read-only
+    readonly_cols = [c for c in buf.columns if c in DERIVED_COLS or c == "subitem_id"]
+    col_cfg = {c: (st.column_config.NumberColumn(disabled=True) if c in DERIVED_COLS
+                   else st.column_config.Column(disabled=True))
+               for c in readonly_cols}
+
     row_ids = tuple(buf["subitem_id"]) if "subitem_id" in buf.columns else tuple(buf.index)
     _editor_fp = (tuple(buf.columns), row_ids)
-    editor_key = f"editor_view_df_{hash(_editor_fp)}"
 
-    readonly_cols = [c for c in buf.columns if c in DERIVED_COLS or c == "subitem_id"]
+    # stable key so Streamlit keeps widget state between reruns
+    editor_key = "editor_view_df"
 
     edited = st.data_editor(
         buf,
@@ -1144,51 +1167,85 @@ if edit_mode:
         use_container_width=True,
         hide_index=True,
         num_rows="dynamic",
-        disabled=readonly_cols,
+        column_config=col_cfg,
     )
 
-    # 3) keep only editable columns in the live buffer; next rerun will recompute derived columns
-    editable_cols = [c for c in edited.columns if c not in (DERIVED_COLS + ["subitem_id"])]
-    st.session_state["_edit_buffer"] = edited[editable_cols].copy()
+    # 5) recompute again from what the user just edited (for immediate export/summary)
+    live = edited.copy()
 
-    # Save + Revert
+
+    cols_str = list(map(str, live.columns))
+    def _need_like2(title: str):
+        if title in cols_str:
+            return title
+        return best_name_match_simple(title, cols_str)
+
+    qty_col2      = _need_like2("Quantity")
+    price_col2    = _need_like2("List Price $")
+    disc_pct_col2 = (_need_like2("Discount (%)")
+                     or _need_like2("Discount %")
+                     or _need_like2("Disc %"))
+
+    qty2  = _num_series(live[qty_col2])      if qty_col2      in live.columns else _num_series(None)
+    lpu2  = _num_series(live[price_col2])    if price_col2    in live.columns else _num_series(None)
+    dpct2 = _num_series(live[disc_pct_col2]) if disc_pct_col2 in live.columns else _num_series(None)
+
+    live[DERIVED_COLS[0]] = (qty2 * lpu2)
+    live[DERIVED_COLS[1]] = (live[DERIVED_COLS[0]] * (dpct2 / 100.0))
+    live[DERIVED_COLS[2]] = (live[DERIVED_COLS[0]] - live[DERIVED_COLS[1]])
+
+    # 6) persist ONLY editable columns back to the buffer for the next rerun
+    st.session_state["_edit_buffer"] = live[editable_cols_base].copy()
+
+    # 7) the dataframe currently shown to the user (with formulas)
+    st.session_state["current_view_df"] = live.copy()
+    # 6) persist ONLY editable columns back to the buffer for the next rerun
+    st.session_state["_edit_buffer"] = live[editable_cols_base].copy()
+
+    # 7) the dataframe currently shown to the user (with formulas)
+    st.session_state["current_view_df"] = live.copy()
+
+    # 🔁 one-shot rerun so the editor re-mounts with fresh derived columns
+    if not st.session_state.get("_just_recomputed", False):
+        st.session_state["_just_recomputed"] = True
+        st.rerun()
+    else:
+        st.session_state.pop("_just_recomputed", None)
+
+    # Save / Revert (unchanged) — use `live` when saving
     c1, c2 = st.columns([1, 1])
     with c1:
         if st.button("💾 Save edits", type="primary", use_container_width=True):
             master = st.session_state["master_df"].set_index("subitem_id") if "subitem_id" in st.session_state["master_df"].columns else st.session_state["master_df"].copy()
-            incoming = edited.set_index("subitem_id") if "subitem_id" in edited.columns else edited.copy()
-
-            # Ensure rows match incoming (supports add/remove)
+            incoming = live.set_index("subitem_id") if "subitem_id" in live.columns else live.copy()
             master = master.reindex(incoming.index)
-
-            updatable = [c for c in editable_cols if c in master.columns]
+            updatable = [c for c in editable_cols_base if c in master.columns]
             master.loc[incoming.index, updatable] = incoming[updatable]
-
             st.session_state["master_df"] = master.reset_index() if "subitem_id" in st.session_state["master_df"].columns else master
             st.success("Edits saved ✔")
+            st.rerun()
 
     with c2:
         if st.button("↩️ Revert unsaved edits", use_container_width=True):
             st.session_state.pop("_edit_buffer", None)
-            # drop any editor key so it remounts cleanly
             for k in list(st.session_state.keys()):
                 if str(k).startswith("editor_view_df_"):
                     st.session_state.pop(k, None)
             st.rerun()
-
-    # what the user is currently seeing (with live formulas)
-    st.session_state["current_view_df"] = edited.copy()
-
 else:
-    # Read-only view with the same formula columns
     st.dataframe(edit_base, use_container_width=True, hide_index=True)
     st.session_state["current_view_df"] = edit_base.copy()
 
 
 
+
 st.write("")  # spacing
 
-export_df = st.session_state["current_view_df"]
+export_df = st.session_state.get(
+    "current_view_df",
+    st.session_state.get("master_df", final_df)
+).copy()
+
 
 c1, c2 = st.columns(2)
 with c1:
@@ -1216,21 +1273,34 @@ if st.button("Reset data to original"):
     st.rerun()
 
 # ===================== SUMMARY (Excel-aligned) ============================
-st.write("")
-
-# 1) Turn the one-shot button into a persistent toggle
-#    (or keep the button but set a session flag)
-c1, c2 = st.columns([1,1])
-with c1:
-    if st.button("📊 Show / refresh summary", use_container_width=True, key="show_summary_btn"):
-        st.session_state["show_summary"] = True
-with c2:
-    if st.button("Hide summary", use_container_width=True, key="hide_summary_btn"):
-        st.session_state["show_summary"] = False
+# Single button: show OR refresh
+st.button(
+    "📊 Show / refresh summary",
+    use_container_width=True,
+    key="show_refresh_summary_btn",
+    on_click=_show_or_refresh_summary,   # <-- ensures recompute + visible
+)
 
 show_summary = st.session_state.get("show_summary", False)
 
 if show_summary:
+    st.session_state.pop("_just_recomputed", None)
+
+
+    # Always summarize exactly what the user sees (live editor or view)
+    src = st.session_state.get("current_view_df")
+    if not isinstance(src, pd.DataFrame) or src.empty:
+        src = st.session_state.get("master_df")
+    if not isinstance(src, pd.DataFrame) or src.empty:
+        st.info("No rows to summarize yet.")
+        st.stop()
+
+    # De-dupe by id if present
+    src = src.copy()
+    if "subitem_id" in src.columns:
+        src = src.drop_duplicates(subset="subitem_id")
+
+
     st.subheader("Quote summary (Excel-aligned)")
 
     # ===== SUMMARY uses the VISIBLE ROWS only, de-duped by subitem_id =====
@@ -1250,70 +1320,121 @@ if show_summary:
             if s is not None:
                 st.write(f"Sum of **{c}**:", f"{float(s.sum()):,.2f}")
 
+
+    # --- resolve columns we may use
     def _need(title):
         if title in src.columns: return title
         return best_name_match_simple(title, list(map(str, src.columns)))
+
 
     def _num_series(name, default=0.0):
         if not name or name not in src.columns:
             return pd.Series([default] * len(src), index=src.index, dtype=float)
         return src[name].map(as_number).fillna(default)
 
-    col_qty       = _need("Quantity")
-    col_list_unit = _need("List Price $")
-    col_amount    = _need("Amount ($)")
-    col_disc_amt  = _need("Discount ($)")
-    col_disc_pct  = _need("Discount (%)")
-    col_cost_unit = _need("CT Cost ($)")
 
-    qty   = _num_series(col_qty, 1.0)
-    lp    = _num_series(col_list_unit, 0.0)
-    amt   = _num_series(col_amount, 0.0)
+    col_qty = _need("Quantity")
+    col_list_unit = _need("List Price $")
+    col_amount = _need("Amount ($)")
+    col_disc_amt = _need("Discount ($)")
+    col_disc_pct = _need("Discount (%)")
+    col_cost_unit = _need("CT Cost ($)")
+    col_row_disc = _need("Row Discount Amount ($)")  # use derived column if present
+    col_total_list = _need("Total List Price ($)")  # derived per-row total if visible
+
+    qty = _num_series(col_qty, 1.0)
+    lp = _num_series(col_list_unit, 0.0)
+    amt = _num_series(col_amount, 0.0)
     discA = _num_series(col_disc_amt, 0.0)
     discP = _num_series(col_disc_pct, 0.0)
     costU = _num_series(col_cost_unit, 0.0)
 
-    # Persist these controls so editing them doesn't close the section
+    # Persist this control so it doesn’t close the section on rerun
     use_amount_logic = st.checkbox(
         "Use Amount logic (Quantity × List Price)",
         value=st.session_state.get("use_amount_logic", False),
         key="use_amount_logic",
-        help="ON = sum Amount (or Quantity×List Price). OFF = sum the unit List Price column."
+        help="ON = use row totals (Quantity×List Price). OFF = use sum of unit List Price column."
     )
 
-    if use_amount_logic:
-        total_list = float(amt.sum()) if col_amount else float((qty * lp).sum())
-        if not col_disc_amt:
-            base_for_disc = amt if col_amount else (qty * lp)
-            discA = base_for_disc * (discP / 100.0)
-    else:
-        total_list = float(lp.sum())
-        if not col_disc_amt:
-            discA = lp * (discP / 100.0)
+    # Compute both “Total List” variants
+    total_list_unitsum = float(lp.sum())  # sum of the *unit* “List Price $” column
+    total_list_rowtotal = (
+        float(_num_series(col_total_list, 0.0).sum())  # prefer the visible derived column
+        if col_total_list else float((qty * lp).sum())  # otherwise recompute qty×price
+    )
 
+    # Pick which definition to use based on the toggle
+    total_list = total_list_rowtotal if use_amount_logic else total_list_unitsum
+
+    # --- Correct Total Discount Amount ($)
+    if col_row_disc:
+        # exact sum of the visible “Row Discount Amount ($)” column
+        total_discount = float(_num_series(col_row_disc, 0.0).sum())
+    elif col_disc_amt:
+        # fall back to explicit “Discount ($)” column if present
+        total_discount = float(discA.sum())
+    else:
+        # last-resort estimate from percentage
+        if use_amount_logic:
+            # percent * (Quantity × List Price)
+            total_discount = float(((qty * lp) * (discP / 100.0)).sum())
+        else:
+            # percent * unit List Price (to mirror OFF behavior)
+            total_discount = float((lp * (discP / 100.0)).sum())
+
+    # Costs and margins
     total_cost = float((qty * costU).sum())
-    total_discount = float(discA.sum())
     net_after_item_disc = total_list - total_discount
     gm_on_list = (1.0 - (total_cost / total_list)) if total_list > 0 else 0.0
     gm_after_item = (1.0 - (total_cost / net_after_item_disc)) if net_after_item_disc > 0 else 0.0
 
-    # Persist the overall discount input
-    if "overall_discount_pct" not in st.session_state:
-        st.session_state["overall_discount_pct"] = 20.0
-    overall_pct = st.number_input(
-        "Overall Discount (%)",
+    # --- Overall Discount input (robust: widget <-> state sync) ---
+    DISC_STATE  = "summary_overall_discount_pct"         # the value you use in calculations
+    DISC_WIDGET = "summary_overall_discount_pct_widget"  # the widget's own key (separate!)
+
+    # init once
+    if DISC_STATE not in st.session_state:
+        st.session_state[DISC_STATE] = 20.0
+
+    # when the widget changes, copy its value into the calc state
+    def _sync_discount_from_widget():
+        st.session_state[DISC_STATE] = float(
+            st.session_state.get(DISC_WIDGET, st.session_state[DISC_STATE])
+        )
+
+    # render the widget with the current state as its displayed value
+    pct_number = st.number_input(
+        "Overall Discount (%) — summary",
         min_value=0.0, max_value=100.0, step=1.0,
-        key="overall_discount_pct",
-        help="Matches the green input on the Excel Summary sheet."
-    ) / 100.0
+        value=float(st.session_state[DISC_STATE]),
+        key=DISC_WIDGET,
+        on_change=_sync_discount_from_widget,
+        help="Matches the green input on the Excel Summary sheet.",
+    )
 
-    overall_discount_amt = total_list * overall_pct
-    net_after_overall = net_after_item_disc - overall_discount_amt
-    gm_after_overall = (1.0 - (total_cost / net_after_overall)) if net_after_overall > 0 else 0.0
+    # also copy back on this run (covers programmatic +/- and manual typing)
+    st.session_state[DISC_STATE] = float(pct_number)
 
-    def _money(x): return f"{x:,.2f}"
-    def _pct(x):   return f"{x * 100:,.1f}%"
+    # use ONLY the decoupled state for calculations
+    overall_pct = float(st.session_state[DISC_STATE]) / 100.0
 
+    # debug
+    st.caption(f"DEBUG: using overall_pct={overall_pct:.3f}")
+
+
+
+
+    # helpers
+    def _money(x):
+        return f"{x:,.2f}"
+
+
+    def _pct(x):
+        return f"{x * 100:,.1f}%"
+
+
+    # 1) LEFT TABLE — Item-Level Metrics
     item_metrics = [
         ("Total List Price ($)", _money(total_list)),
         ("Total Discount Amount ($)", _money(total_discount)),
@@ -1322,17 +1443,24 @@ if show_summary:
         ("Gross Margin on List Price (%)", _pct(gm_on_list)),
         ("Gross Margin after Item Discounts (%)", _pct(gm_after_item)),
     ]
-    overall_metrics = [
-        ("Overall Discount (%)", _pct(overall_pct)),
-        ("Overall Discount Amount ($)", _money(overall_discount_amt)),
-        ("Net Revenue After Overall Discount ($)", _money(net_after_overall)),
-        ("Gross Margin after Overall Discount (%)", _pct(gm_after_overall)),
-    ]
-
-    # Build DataFrames for display & export
     df_item = pd.DataFrame(item_metrics, columns=["Metric", "Value"])
-    df_over = pd.DataFrame(overall_metrics, columns=["Metric", "Value"])
 
+    # 2) RIGHT TABLE — Overall Discount Analysis (driven by overall_pct above)
+    overall_discount_amt = float(total_list * overall_pct)
+    net_after_overall = float(net_after_item_disc - overall_discount_amt)
+    gm_after_overall = (1.0 - (total_cost / net_after_overall)) if net_after_overall > 0 else 0.0
+
+    df_over = pd.DataFrame(
+        [
+            ("Overall Discount (%)", f"{pct_number:,.1f}%"),
+            ("Overall Discount Amount ($)", _money(overall_discount_amt)),
+            ("Net Revenue After Overall Discount ($)", _money(net_after_overall)),
+            ("Gross Margin after Overall Discount (%)", _pct(gm_after_overall)),
+        ],
+        columns=["Metric", "Value"],
+    )
+
+    # 3) RENDER BOTH TABLES
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("**Item-Level Metrics**")
