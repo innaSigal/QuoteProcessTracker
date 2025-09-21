@@ -1,0 +1,6 @@
+streamlit>=1.33
+pandas>=2.1
+requests>=2.31
+openpyxl>=3.1
+xlsxwriter>=3.1
+
