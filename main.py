@@ -1311,14 +1311,6 @@ if show_summary:
     if "subitem_id" in src.columns:
         src = src.drop_duplicates(subset="subitem_id")
 
-    with st.expander("ℹ️ Summary debug (rows & quick totals)", expanded=False):
-        st.write("Rows used in summary:", len(src))
-        def _num(col):
-            return src[col].map(as_number).fillna(0.0) if col in src.columns else None
-        for c in ["Quantity", "List Price $", "Amount ($)", "Discount ($)", "CT Cost ($)"]:
-            s = _num(c)
-            if s is not None:
-                st.write(f"Sum of **{c}**:", f"{float(s.sum()):,.2f}")
 
 
     # --- resolve columns we may use
@@ -1350,12 +1342,7 @@ if show_summary:
     costU = _num_series(col_cost_unit, 0.0)
 
     # Persist this control so it doesn’t close the section on rerun
-    use_amount_logic = st.checkbox(
-        "Use Amount logic (Quantity × List Price)",
-        value=st.session_state.get("use_amount_logic", False),
-        key="use_amount_logic",
-        help="ON = use row totals (Quantity×List Price). OFF = use sum of unit List Price column."
-    )
+    use_amount_logic = False  # no UI; always use unit List Price sum
 
     # Compute both “Total List” variants
     total_list_unitsum = float(lp.sum())  # sum of the *unit* “List Price $” column
@@ -1419,8 +1406,7 @@ if show_summary:
     # use ONLY the decoupled state for calculations
     overall_pct = float(st.session_state[DISC_STATE]) / 100.0
 
-    # debug
-    st.caption(f"DEBUG: using overall_pct={overall_pct:.3f}")
+
 
 
 
