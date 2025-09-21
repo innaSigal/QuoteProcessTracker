@@ -1021,9 +1021,9 @@ if "master_df" not in st.session_state:
 
 # --- COLUMN PICKER + EXPORT (safe state pattern) ---
 def _on_view_changed():
-    # force the editor to remount when filters/columns change
+    # Remount the editor BUT preserve unsaved edits in _edit_buffer
     st.session_state.pop("editor_view_df", None)
-    st.session_state.pop("_edit_buffer", None)   # ← add this line
+
 
 
 with st.container(border=True):
